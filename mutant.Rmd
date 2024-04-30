@@ -1,0 +1,368 @@
+---
+title: "EGFR_mutant"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+
+# load library
+library("limma")
+library("edgeR")
+library("glmnet")
+library("factoextra")
+library("FactoMineR")
+library("caret")
+library("SummarizedExperiment")
+library("gplots")
+library("survival")
+library("survminer")
+library("RColorBrewer")
+library("gProfileR")
+library("genefilter")
+library('gprofiler2')
+library('dplyr')
+library(pheatmap)
+library(dendextend)
+
+# Clear the entire environment
+#rm(list = ls())
+
+```
+
+### Extract tumor patients with EGFR mutation
+
+```{r, warning=FALSE, message=FALSE}
+tcga_data = readRDS(file = "data/tcga_luad_data.RDS")
+tcga_data_disease = tcga_data[,colData(tcga_data)$definition == "Primary solid Tumor"] # KEEP TUMOR
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+
+# import mutant info
+EGFR_patient <- read.table("data/explore-case-table-2023-12-06.tsv",skip=1, sep = "\t")
+colnames(EGFR_patient)[1] <- "patient"
+
+# KEEP  patients with EGFR mutation
+tcga_data_disease$is_EGFR_mutant = tcga_data_disease$patient %in% EGFR_patient$patient
+tcga_EGFR = tcga_data_disease[, tcga_data_disease$is_EGFR_mutant]
+
+# remove outliers based on initial NMF
+tcga_EGFR = tcga_EGFR[, !tcga_EGFR$barcode%in% c("TCGA-44-5645-01B-04R-A277-07", "TCGA-44-6147-01B-06R-A277-07")]
+## above two patients looks like outlier based on initial NMF
+
+```
+
+### Remove patients with obscure pattern in gene expression
+```{r, warning=FALSE, message=FALSE}
+
+  ## pure data normalization using limma
+  dge = DGEList(counts=assay(tcga_EGFR),
+                samples=colData(tcga_EGFR),
+                genes=as.data.frame(rowData(tcga_EGFR)))
+  keep = filterByExpr(dge, design = NULL)# defining which genes to keep
+  dge = dge[keep,,keep.lib.sizes=FALSE]# filtering the dge object
+  rm(keep)# 
+  # Normalization (TMM followed by voom)
+  dge = calcNormFactors(dge, method="TMM") #Trimmed Mean of M-values - > remove batch effects
+  v = voom(dge, design = NULL, plot=FALSE) #mean-variance modelling at the observational level
+  
+  ### apply NMF to examine clusters
+  log2.norm.count = log2(2^v$E + 1)
+  library(NMF)
+  res = nmf(log2.norm.count, rank = 2)
+  V.hat <- fitted(res)
+  w <- basis(res)
+  h <- coef(res)
+
+  
+  my_hclust_subj <- hclust(dist(t(h)), method = "complete")
+  my_subj_cluster <- cutree(tree = as.dendrogram(my_hclust_subj), k = 5)
+  my_subj_cluster <- data.frame(cluster = 
+                                ifelse(test = my_subj_cluster == 4, 
+                                       yes = "cluster 1", 
+                                       no = "cluster 2"))
+pheatmap(h,
+         annotation_col = my_subj_cluster,
+         fontsize_row = 7,
+         show_colnames = FALSE)
+
+my_subj_cluster <- cutree(tree = as.dendrogram(my_hclust_subj), k = 5)
+rm.ID = names(which(my_subj_cluster == 4)) ### remove those patients that cannot be clearly clustered.
+
+###
+tcga_EGFR = tcga_EGFR[, !tcga_EGFR$barcode%in%rm.ID] 
+###
+
+```
+
+
+### double check whether the unclear patients are cleaned 
+```{r, warning=FALSE, message=FALSE}
+
+   #tcga_EGFR = readRDS(file = "tcga_EGFR_filtered.RDS")
+   dge = DGEList(counts=assay(tcga_EGFR),
+                samples=colData(tcga_EGFR),
+                genes=as.data.frame(rowData(tcga_EGFR)))
+  
+  # filtering
+  keep = filterByExpr(dge,design = NULL)# defining which genes to keep
+  dge = dge[keep,,keep.lib.sizes=FALSE]# filtering the dge object
+  rm(keep)# 
+  dge = calcNormFactors(dge,method="TMM") 
+  v = voom(dge, design = NULL, plot=FALSE) 
+  log2.norm.count = log2(2^v$E + 1)
+  
+  ### apply NMF
+  library(NMF)
+  res = nmf(log2.norm.count, rank = 2)
+  V.hat <- fitted(res)
+  w <- basis(res)
+  h <- coef(res)
+ # pheatmap(h, cluster_cols = TRUE)
+  my_hclust_subj <- hclust(dist(t(h)), method = "complete")
+  my_subj_cluster <- cutree(tree = as.dendrogram(my_hclust_subj), k = 2)
+  my_subj_cluster <- data.frame(cluster = 
+                                ifelse(test = my_subj_cluster == 1, 
+                                       yes = "cluster 1", 
+                                       no = "cluster 2"))
+pheatmap(h,
+         annotation_col = my_subj_cluster,
+        fontsize_row = 7,
+        show_colnames = FALSE)
+
+### then create label for each patient based on clustering
+  my_hclust_subj <- hclust(dist(t(h)), method = "complete")
+  my_subj_cluster <- cutree(tree = as.dendrogram(my_hclust_subj), k = 2)
+  
+  all(names(my_subj_cluster) == tcga_EGFR$barcode)
+  tcga_EGFR$Cluster = my_subj_cluster
+  saveRDS(tcga_EGFR, file = "data/tcga_EGFR_filtered.RDS")
+  
+```
+
+### PCA on cleaned data
+```{r, warning=FALSE, message=FALSE}
+
+  group = factor(my_subj_cluster)
+  pca = prcomp(t(v$E))
+  plot(pca$x[,1:2], pch=19, col = group)
+  legend("bottomleft", inset=.01, legend = paste0("Cluster ", levels(group)), 
+         pch=19, col=1:length(levels(group)))
+  ## save
+  pdf(file = "output/EGFRmutant_PCA_TwoCluster.pdf", width = 5, height = 5)
+  plot(pca$x[,1:2], pch=19, col = group)
+  legend("bottomleft",  inset=.01, legend = paste0("Cluster ", levels(group)),
+         pch=19, col=1:length(levels(group)))
+  dev.off()
+  
+```
+
+### Call DE gene using limma, based on preprocessed data
+```{r, warning=FALSE, message=FALSE}
+
+source("limma_pipeline.R")
+#return normalized data of mutants, model and top 100 genes(EGFR mutant)
+limma_res_EGFR = limma_pipeline(
+  tcga_data=tcga_EGFR,
+  condition_variable="Cluster",
+  reference_group="1",
+  topNumber = 1000)
+limma_res_EGFR$Cluster = tcga_EGFR$Cluster
+saveRDS(object = limma_res_EGFR,
+        file = "limma_res_EGFR.RDS",
+        compress = FALSE)
+```
+
+
+#### Take a look at DE genes between the two Clusters
+```{r, warning=FALSE, message=FALSE}
+
+limma_res_EGFR = readRDS(file = "limma_res_EGFR.RDS")
+topGenes = limma_res_EGFR$topGenes
+topGenes = topGenes[,c("gene_name", "logFC", "AveExpr","t" , "adj.P.Val")]
+topGenes$HighInCluster2 = ifelse(topGenes$logFC > 0, TRUE, FALSE)
+
+library(dplyr)
+limma_topGene <- topGenes %>% arrange(HighInCluster2, adj.P.Val)
+sum(limma_topGene$logFC < 0)
+limma_topGene[c(1:25, 517:541),]
+
+```
+
+#### save counts of DE top genes, both raw and normalized, into a table
+```{r}
+## column ordered by cluster: 
+### the first 1:29 columns are cluster 1, and the remaining 27 columns are cluster 2
+all(colnames(limma_res_EGFR$voomObj$E) == colnames( assay(tcga_EGFR)))
+rowcounts = assay(tcga_EGFR)[rownames(limma_topGene), order(tcga_EGFR$Cluster)]
+Normcounts = round(2^limma_res_EGFR$voomObj$E[rownames(limma_topGene), order(tcga_EGFR$Cluster)],2)
+all(rownames(rowcounts) == rownames(limma_topGene))
+all(rownames(Normcounts) == rownames(limma_topGene))
+
+rownames(rowcounts) = rownames(Normcounts) = limma_topGene$gene_name
+write.csv(rowcounts, file = "output/EGFR_Top1000_DEgenes_rowCount.csv")
+write.csv(Normcounts, file = "output/EGFR_Top1000_DEgenes_NormCount.csv")
+
+```
+
+
+
+#### visualize the pattern, and annotate both rows and columns
+```{r, warning=FALSE, message=FALSE}
+# top genes selected by limma 
+library(pheatmap)
+##### reorder E
+Clust1.ID = which(limma_res_EGFR$Cluster == 1)
+Clust2.ID = which(limma_res_EGFR$Cluster == 2)
+log2.norm.count = limma_res_EGFR$voomObj$E
+colnames(log2.norm.count)[Clust1.ID] = paste0("C1_", Clust1.ID)
+colnames(log2.norm.count)[Clust2.ID] = paste0("C2_", Clust2.ID)
+
+ord.log2.norm.count = log2.norm.count[,order(colnames(log2.norm.count))]
+
+use.geneID = c(1:25, 517:541)
+use.count = ord.log2.norm.count[rownames(limma_topGene)[use.geneID],]
+rownames(use.count) = limma_topGene$gene_name[use.geneID]
+
+cal_z_score <- function(x){ (x - mean(x)) / sd(x)}
+use.count.zscore <- t(apply(use.count, 1, cal_z_score))
+#pheatmap(use.count.zscore, cluster_cols = FALSE)
+#pheatmap(use.count.zscore)
+
+
+library(dendextend)
+my_hclust_gene <- hclust(dist(use.count.zscore), method = "complete")
+my_gene_col <- cutree(tree = as.dendrogram(my_hclust_gene), k = 2)
+my_gene_col <- data.frame(Genes = ifelse(test = my_gene_col == 1, yes = "cluster 1", no = "cluster 2"))
+
+my_sample_col <- data.frame(Patients = rep(c("Cluster 1", "Cluster 2"), c(length(Clust1.ID),length(Clust2.ID))))
+row.names(my_sample_col) <- colnames(ord.log2.norm.count)
+pheatmap(use.count.zscore, 
+        annotation_row = my_gene_col, 
+         annotation_col = my_sample_col, 
+        show_colnames = FALSE,
+        fontsize_row = 5)
+
+my_hclust_subj <- hclust(dist(t(use.count.zscore)), method = "complete")
+my_subj_cluster <- cutree(tree = as.dendrogram(my_hclust_subj), k = 2)
+table(my_subj_cluster, my_sample_col$Patients)### perfect separation
+
+### save the picture
+# pdf(file = "EGFRmutant_Heatmap_TwoCluster.pdf", height = 7, width = 7)
+# print(pheatmap(use.count.zscore, 
+#          annotation_row = my_gene_col, 
+#          annotation_col = my_sample_col,
+#         fontsize_row = 7,
+#         show_colnames = FALSE))
+# dev.off()
+
+heatmap_filename <- "EGFRmutant_Heatmap_TwoCluster.png"
+save_heatmap <- function(filename) {
+  pheatmap(use.count.zscore,
+         annotation_row = my_gene_col,
+         annotation_col = my_sample_col,
+        fontsize_row = 7,
+        show_colnames = FALSE,
+        filename = heatmap_filename)
+
+}
+save_heatmap(heatmap_filename)
+#knitr::include_graphics(heatmap_filename)
+```
+
+### Significant difference in survival time between the two clusters
+```{r, warning=FALSE, message=FALSE}
+
+clinical = tcga_EGFR@colData
+# we are only interested in the "Primary solid Tumor" cases for survival
+clin_df = clinical[, c("patient","vital_status", 
+                       "days_to_death", "days_to_last_follow_up",
+                       "ajcc_pathologic_stage", "gender", "Cluster")]
+dim(clin_df)
+
+# create a new boolean variable that has TRUE for dead patients
+# and FALSE for live patients
+clin_df$deceased = clin_df$vital_status == "Dead"
+clin_df$overall_survival = ifelse(clin_df$deceased,
+                                  clin_df$days_to_death,
+                                  clin_df$days_to_last_follow_up)
+
+clin_df$Cluster1 <- ifelse(clin_df$Cluster == 1, TRUE, FALSE)
+
+# fit a survival model
+fit = survfit(Surv(overall_survival, deceased) ~ Cluster1, data=clin_df)
+print(fit)
+ggsurvplot(fit, data=clin_df,pval=T)
+
+```
+
+
+### Check whether cluster label is associated with gender
+```{r, message=FALSE, warning=FALSE}
+
+confusion.mat = table(clinical$gender, clinical$Cluster)
+#OR >1 
+dat = data.frame(y = ifelse(clinical$Cluster == "1", 0, 1),
+                 x = clinical$gender)
+res = glm(y~x, data = dat, family = "binomial")
+# association is not significant
+summary(res)
+
+```
+
+### check whether cluster label is associated with age
+```{r, message=FALSE, warning=FALSE}
+
+dat = data.frame(y = ifelse(clinical$Cluster == "1", 0, 1),
+                 x = clinical$age_at_diagnosis)
+res = glm(y~x, data = dat, family = "binomial")
+summary(res)
+# association is not significant
+boxplot(clinical$age_at_diagnosis ~ clinical$Cluster, 
+        xlab = "Cluster", ylab = "age at diagnosis")
+
+```
+
+
+### check whether cluster label is associated with weight
+```{r, message=FALSE, warning=FALSE}
+
+dat = data.frame(y = ifelse(clinical$Cluster == "1", 0, 1),
+                 x = clinical$initial_weight)
+res = glm(y~x, data = dat, family = "binomial")
+summary(res)
+boxplot(clinical$initial_weight ~ clinical$Cluster, 
+        xlab = "Cluster", ylab = "Initial weight")
+### not meaningful because a lot of missing value
+
+```
+
+
+### check whether cluster label is associated with $ajcc\_pathologic\_stage$
+```{r,message=FALSE, warning=FALSE}
+
+collapseStage = ifelse( clinical$ajcc_pathologic_stage %in% c("Stage I", "Stage IA", "Stage IB"),  "early", "late")
+
+# ## alternatively
+# collapseStage = ifelse( clinical$ajcc_pathologic_t %in%c("T1", "T1a", "T1b"),  "early", "late")
+
+dat = data.frame(y = ifelse(clinical$Cluster == "1", 0, 1),
+                 x = collapseStage)
+res = glm(y~x, data = dat, family = "binomial")
+
+print(summary(res))
+confus = table(clinical$Cluster, collapseStage)
+confus
+OR = (19*20)/(7*10)
+cat("Odds Ratio = ", OR, sep = "\t")
+cat("Patients in Cluster 1 are mainly at early pathologic stage, while patients in Cluster 2 are mainly at late pathologic stage", sep = "\n")
+
+```
+
